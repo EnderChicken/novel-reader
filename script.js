@@ -167,9 +167,7 @@
 
   var CHAPTER_RE = /^\s*(chapter|part|book|act|prologue|epilogue|preface|introduction|section|scene)\s+([0-9]+|[ivxlcdm]+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b.*$/i;
 
-  function parseTxt(buf, fileName) {
-    var text = decodeText(buf).replace(/\uFEFF/g, "");
-    var lines = text.split(/\r\n|\r|\n/);
+  function createChapterParser() {
     var chapters = [];
     var cur = { title: "Start", paragraphs: [] };
     var para = [];
@@ -184,25 +182,65 @@
       if (cur.paragraphs.length) chapters.push(cur);
     }
 
-    for (var i = 0; i < lines.length; i++) {
-      var line = lines[i].trim();
-      if (line === "") {
-        flushPara();
-        continue;
-      }
-      if (CHAPTER_RE.test(line) && line.length < 90) {
+    return {
+      feed: function (line) {
+        line = line.trim();
+        if (line === "") {
+          flushPara();
+          return;
+        }
+        if (CHAPTER_RE.test(line) && line.length < 90) {
+          pushChapter();
+          cur = { title: line.replace(/\s+/g, " "), paragraphs: [] };
+          return;
+        }
+        para.push(line);
+      },
+      finish: function () {
         pushChapter();
-        cur = { title: line.replace(/\s+/g, " "), paragraphs: [] };
-        continue;
-      }
-      para.push(line);
-    }
-    pushChapter();
+        return chapters;
+      },
+    };
+  }
 
+  function parseTxt(buf, fileName) {
+    var text = decodeText(buf).replace(/\uFEFF/g, "");
+    var parser = createChapterParser();
+    text.split(/\r\n|\r|\n/).forEach(parser.feed);
+    var chapters = parser.finish();
     if (!chapters.length) {
-      chapters.push({ title: stripExt(fileName), paragraphs: para.length ? [para.join(" ")] : [] });
+      chapters.push({ title: stripExt(fileName), paragraphs: [] });
     }
     return chapters;
+  }
+
+  /* Non-blocking variant: yields to the UI thread between batches so a
+     huge .txt (many MB) doesn't freeze the page while it's parsed. */
+  function parseTxtAsync(buf, fileName, onProgress) {
+    return new Promise(function (resolve) {
+      var text = decodeText(buf).replace(/\uFEFF/g, "");
+      var lines = text.split(/\r\n|\r|\n/);
+      var parser = createChapterParser();
+      var BATCH = 4000;
+      var i = 0;
+
+      function step() {
+        var end = Math.min(i + BATCH, lines.length);
+        for (; i < end; i++) parser.feed(lines[i]);
+        if (onProgress) onProgress(end / lines.length);
+        if (i < lines.length) {
+          setTimeout(step, 0);
+          return;
+        }
+        var chapters = parser.finish();
+        if (!chapters.length) {
+          chapters.push({ title: stripExt(fileName), paragraphs: [] });
+        }
+        resolve(chapters);
+      }
+
+      step();
+    });
   }
 
   /* ============================================================
@@ -384,8 +422,26 @@
   /* ============================================================
      PDF parsing (pdf.js)
   ============================================================ */
+  var PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+  var PDFJS_WORKER_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+  /* pdf.js (~1MB) is loaded on demand only when a .pdf book is opened,
+     so it doesn't block or slow down the .txt library. */
+  function loadPdfjs() {
+    return new Promise(function (resolve, reject) {
+      if (window.pdfjsLib) return resolve();
+      var s = document.createElement("script");
+      s.src = PDFJS_URL;
+      s.crossOrigin = "anonymous";
+      s.async = true;
+      s.onload = function () { resolve(); };
+      s.onerror = function () { reject(new Error("Failed to load the PDF engine (check internet).")); };
+      document.head.appendChild(s);
+    });
+  }
+
   async function parsePdf(buf) {
-    if (!window.pdfjsLib) throw new Error("PDF engine not available (check internet).");
+    await loadPdfjs();
     var pdf = await window.pdfjsLib.getDocument({ data: buf.slice(0) }).promise;
     var meta = { title: null, author: "" };
     try {
@@ -522,11 +578,15 @@
         var res = await fetch("books/" + encodeURIComponent(book.fileName));
         if (!res.ok) throw new Error("HTTP " + res.status);
         var buf = await res.arrayBuffer();
-        book.chapters = parseTxt(buf, book.fileName);
+        book.chapters = await parseTxtAsync(buf, book.fileName, function (p) {
+          if (state.openingBook === id && p < 1) {
+            toast("Parsing \u201C" + book.title + "\u201D \u2026 " + Math.round(p * 100) + "%");
+          }
+        });
         book.wordCount = 0;
         book.chapters.forEach(function (c) {
-          c.paragraphs.forEach(function (p) {
-            book.wordCount += p.split(/\s+/).length;
+          c.paragraphs.forEach(function (p2) {
+            book.wordCount += p2.split(/\s+/).length;
           });
         });
         book.numChapters = book.chapters.length;
@@ -671,16 +731,12 @@
   function loadPdfDoc(book, page, restore) {
     state.pdfRendering = true;
     $("#reader-content").innerHTML = '<p class="reader-empty">Loading PDF\u2026</p>';
-    if (!window.pdfjsLib) {
-      $("#reader-content").innerHTML = '<p class="reader-empty">PDF support requires an internet connection (pdf.js was not loaded).</p>';
-      state.pdfRendering = false;
-      return;
-    }
-    window.pdfjsLib.GlobalWorkerOptions.workerSrc =
-      "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-    window.pdfjsLib
-      .getDocument({ data: book.file.slice(0) })
-      .promise.then(function (pdf) {
+    loadPdfjs()
+      .then(function () {
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL;
+        return window.pdfjsLib.getDocument({ data: book.file.slice(0) }).promise;
+      })
+      .then(function (pdf) {
         state.pdf = pdf;
         state.pdfRendering = false;
         drawPdfPage(page, restore);
@@ -688,7 +744,8 @@
       .catch(function (err) {
         console.error(err);
         state.pdfRendering = false;
-        $("#reader-content").innerHTML = '<p class="reader-empty">Could not load this PDF.</p>';
+        $("#reader-content").innerHTML =
+          '<p class="reader-empty">Could not load this PDF' + (err.message ? " \u2014 " + err.message : "") + ".</p>";
       });
   }
 
@@ -1320,6 +1377,7 @@
   window.__enderread = {
     decodeText: decodeText,
     parseTxt: parseTxt,
+    parseTxtAsync: parseTxtAsync,
     parseEpub: parseEpub,
     readZip: readZip,
     sentenceSplit: sentenceSplit,

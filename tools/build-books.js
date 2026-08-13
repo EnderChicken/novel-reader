@@ -63,7 +63,7 @@ const books = fs
 const cards = books
   .map((b) => {
     return (
-      '<a class="book-card" style="--hue:' + coverHue(b.title) + '" href="/?book=' +
+      '<a class="book-card" style="--hue:' + coverHue(b.title) + '" href="index.html?book=' +
       encodeURIComponent(b.fileName) + '">' +
       '<div class="book-cover"><span class="book-cover-title">' + esc(initials(b.title)) + "</span>" +
       '<span class="book-type">TXT</span></div>' +
@@ -93,11 +93,11 @@ const html =
   '\n  <div class="view">\n' +
   '    <header class="lib-header">\n' +
   '      <div class="lib-header-inner">\n' +
-  '        <a href="/" class="brand">\n' +
+  '        <a href="index.html" class="brand">\n' +
   '          <span class="brand-mark">\u2712</span>\n' +
   '          <span class="brand-text">EnderRead</span>\n' +
   "        </a>\n" +
-  '        <a class="btn-secondary" href="/">Back to reader</a>\n' +
+  '        <a class="btn-secondary" href="index.html">Back to reader</a>\n' +
   "      </div>\n" +
   "    </header>\n" +
   '\n    <main class="lib-main">\n' +
